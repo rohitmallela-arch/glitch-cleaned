@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+*.bak.*
+*.log
+.DS_Store
+docs/OPS_STATE_GLITCH.md.snapshot.*

@@ -1,0 +1,6 @@
+flask
+requests
+google-cloud-firestore
+twilio
+stripe
+gunicorn
