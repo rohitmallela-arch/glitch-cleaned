@@ -1,0 +1,5 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'us-central1-docker.pkg.dev/theglitchapp/cloud-run-source-deploy/glitch-webhook@sha256:$SHORT_SHA', '.']
+images:
+- 'us-central1-docker.pkg.dev/theglitchapp/cloud-run-source-deploy/glitch-webhook@sha256:$SHORT_SHA'
