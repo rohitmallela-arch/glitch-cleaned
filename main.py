@@ -759,6 +759,7 @@ def root():
 @app.route("/healthz", methods=["GET"])
 @app.route("/healthz/", methods=["GET"])
 def healthz():
+    log.info("healthz_hit path=%s host=%s", request.path, request.host)
     return jsonify({"ok": True}), 200
 
 
