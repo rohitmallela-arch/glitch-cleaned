@@ -1,6 +1,7 @@
 flask
 requests
 google-cloud-firestore
+google-auth
 twilio
 stripe
 gunicorn
