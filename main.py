@@ -1,48 +1,22 @@
-import base64
 import datetime
 import hashlib
-import hmac
-import json
 import logging
 import os
-import re
 import traceback
-from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, jsonify, make_response, redirect, request
+import stripe
+from flask import Flask, jsonify, make_response, request
 
 from google.cloud import firestore
+from google.auth.transport import requests as grequests
+from google.oauth2 import id_token as google_id_token
 
-# ----------------------------------------------------------------------------- 
-# Optional SMS welcome (Twilio) — used by manual onboarding flows
-# -----------------------------------------------------------------------------
-WELCOME_SMS = "Welcome to Glitch. You will receive shortage alerts for your watchlist.\n\nReply STOP to unsubscribe anytime."
-
-def maybe_send_welcome_sms(phone_e164: str) -> bool:
-    """Best-effort SMS welcome. Returns True if send attempt succeeded."""
-    if not phone_e164:
-        return False
-
-    tw_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    tw_token = os.environ.get("TWILIO_AUTH_TOKEN")
-    tw_from = os.environ.get("TWILIO_FROM_NUMBER")
-    if not (tw_sid and tw_token and tw_from):
-        return False
-
-    try:
-        from twilio.rest import Client  # type: ignore
-
-        Client(tw_sid, tw_token).messages.create(
-            to=phone_e164,
-            from_=tw_from,
-            body=WELCOME_SMS,
-        )
-        return True
-    except Exception:
-        # Never crash startup / onboarding on SMS issues
-        return False
+from twilio.request_validator import RequestValidator
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client as TwilioClient
 
 # -----------------------------------------------------------------------------
 # App + logging
@@ -62,14 +36,35 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
         return None
     return v.strip() if isinstance(v, str) else v
 
-
 def _bool_env(name: str, default: bool = False) -> bool:
     v = _env(name)
     if v is None:
         return default
-    return v.lower() in ("1", "true", "yes", "y", "on")
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+def _today_yyyymmdd_utc() -> str:
+    return datetime.datetime.utcnow().strftime("%Y%m%d")
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _user_id_from_phone(phone_e164: str) -> str:
+    return "u_" + _sha256_hex(phone_e164.strip())
+
+def _ndc_digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+# -----------------------------------------------------------------------------
+# Firestore
+# -----------------------------------------------------------------------------
+db = firestore.Client()
+
+# -----------------------------------------------------------------------------
+# Global gates / config
+# -----------------------------------------------------------------------------
 PAYMENTS_ENABLED = _bool_env("PAYMENTS_ENABLED", False)
 
 STRIPE_PRICE_ID = _env("STRIPE_PRICE_ID")
@@ -79,21 +74,11 @@ CHECKOUT_CANCEL_URL = _env("CHECKOUT_CANCEL_URL")
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# -----------------------------------------------------------------------------
-# Firestore
-# -----------------------------------------------------------------------------
-db = firestore.Client()
+FDA_SHORTAGE_URL = (_env("FDA_SHORTAGE_URL") or "").strip() or "https://www.accessdata.fda.gov/scripts/drugshortages/api/drugshortages.json"
 
 # -----------------------------------------------------------------------------
 # Milestone C.2 — Plan limits & abuse containment (fail-closed)
 # -----------------------------------------------------------------------------
-
-def _bool_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
-
 FAIL_CLOSED_LIMITS = _bool_env("FAIL_CLOSED_LIMITS", True)
 
 def _require_int_env(name: str) -> int:
@@ -115,7 +100,6 @@ def _limits() -> dict:
       - MAX_ALERTS_PER_DAY
       - MAX_ALERTS_PER_NDC_PER_DAY
       - WEEKLY_RECAP_MAX_ITEMS
-      - FAIL_CLOSED_LIMITS (optional; defaults true)
     """
     return {
         "MAX_WATCHLIST_ITEMS": _require_int_env("MAX_WATCHLIST_ITEMS"),
@@ -125,14 +109,14 @@ def _limits() -> dict:
         "FAIL_CLOSED_LIMITS": FAIL_CLOSED_LIMITS,
     }
 
-def _safe_limits_or_none():
+def _safe_limits_or_none() -> Optional[dict]:
     try:
         return _limits()
     except Exception as e:
         if FAIL_CLOSED_LIMITS:
             log.error("limits_missing_or_invalid err=%s fail_closed=true", str(e))
             return None
-        # non-fail-closed mode (not recommended) => safe lows
+        # Non-fail-closed mode (not recommended) => safe lows
         return {
             "MAX_WATCHLIST_ITEMS": 25,
             "MAX_ALERTS_PER_DAY": 20,
@@ -144,25 +128,25 @@ def _safe_limits_or_none():
 def _enforce_watchlist_limit(user_id: str, ndcs: list, source: str) -> None:
     lim = _safe_limits_or_none()
     if lim is None:
-        log.info("watchlist_limit_exceeded user_id=%s limit=%s observed=%s source=%s fail_closed=true",
-                 str(user_id), "missing_env", str(len(ndcs or [])), str(source))
+        log.info(
+            "watchlist_limit_exceeded user_id=%s limit=%s observed=%s source=%s fail_closed=true",
+            str(user_id), "missing_env", str(len(ndcs or [])), str(source)
+        )
         raise ValueError("limits_missing_or_invalid")
 
     max_items = lim["MAX_WATCHLIST_ITEMS"]
     observed = len(ndcs or [])
     if observed > max_items:
-        log.info("watchlist_limit_exceeded user_id=%s limit=%s observed=%s source=%s fail_closed=true",
-                 str(user_id), str(max_items), str(observed), str(source))
+        log.info(
+            "watchlist_limit_exceeded user_id=%s limit=%s observed=%s source=%s fail_closed=true",
+            str(user_id), str(max_items), str(observed), str(source)
+        )
         raise ValueError("watchlist_limit_exceeded")
-
-def _today_yyyymmdd_utc() -> str:
-    import datetime
-    return datetime.datetime.utcnow().strftime("%Y%m%d")
 
 def _rate_limit_doc_ref(user_id: str, day: str):
     return db.collection("users").document(user_id).collection("rate_limits").document(day)
 
-def _reserve_send_quota(user_id: str, ndc: str | None):
+def _reserve_send_quota(user_id: str, ndc: Optional[str]):
     """
     Transactionally reserve 1 send quota for (user_id, today).
     Returns (allowed: bool, details: dict).
@@ -192,12 +176,24 @@ def _reserve_send_quota(user_id: str, ndc: str | None):
             ndc_count = int(by_ndc.get(ndc) or 0)
 
         if total + 1 > max_total:
-            return (False, {"day": day, "observed_total": total, "limit_total": max_total,
-                            "ndc": ndc or "none", "observed_ndc": ndc_count, "limit_ndc": max_ndc})
+            return (False, {
+                "day": day,
+                "observed_total": total,
+                "limit_total": max_total,
+                "ndc": ndc or "none",
+                "observed_ndc": ndc_count,
+                "limit_ndc": max_ndc,
+            })
 
         if ndc and (ndc_count + 1 > max_ndc):
-            return (False, {"day": day, "observed_total": total, "limit_total": max_total,
-                            "ndc": ndc, "observed_ndc": ndc_count, "limit_ndc": max_ndc})
+            return (False, {
+                "day": day,
+                "observed_total": total,
+                "limit_total": max_total,
+                "ndc": ndc,
+                "observed_ndc": ndc_count,
+                "limit_ndc": max_ndc,
+            })
 
         new_total = total + 1
         new_by_ndc = dict(by_ndc)
@@ -211,40 +207,30 @@ def _reserve_send_quota(user_id: str, ndc: str | None):
             "updated_at": _now_iso(),
         }, merge=True)
 
-        return (True, {"day": day, "observed_total": total, "limit_total": max_total,
-                       "ndc": ndc or "none", "observed_ndc": ndc_count, "limit_ndc": max_ndc})
+        return (True, {
+            "day": day,
+            "observed_total": total,
+            "limit_total": max_total,
+            "ndc": ndc or "none",
+            "observed_ndc": ndc_count,
+            "limit_ndc": max_ndc,
+        })
 
     try:
         return _txn(txn)
     except Exception as e:
-        log.info("rate_limit_state_error user_id=%s ndc=%s reason=%s fail_closed=true",
-                 str(user_id), str(ndc or "none"), str(e))
+        log.info(
+            "rate_limit_state_error user_id=%s ndc=%s reason=%s fail_closed=true",
+            str(user_id), str(ndc or "none"), str(e)
+        )
         return (False, {"reason": "firestore_txn_failed", "err": str(e)})
 
-
-
 # -----------------------------------------------------------------------------
-# Utilities
+# Watchlist parsing (strict, fail-closed)
 # -----------------------------------------------------------------------------
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _user_id_from_phone(phone_e164: str) -> str:
-    return "u_" + _sha256_hex(phone_e164.strip())
-
-
-def _ndc_digits(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
-
-
 def _parse_watchlist_ndcs(raw: Optional[str]) -> List[str]:
     """
-    Strict watchlist parsing (Milestone C.2):
+    Strict watchlist parsing:
       - Input: comma-separated tokens
       - Each token must be digits-only (fail-closed on invalid token)
       - Output: deterministic de-duplicated list (preserves first-seen order)
@@ -266,6 +252,9 @@ def _parse_watchlist_ndcs(raw: Optional[str]) -> List[str]:
             out.append(tok)
     return out
 
+# -----------------------------------------------------------------------------
+# Stripe env checks
+# -----------------------------------------------------------------------------
 def _require_checkout_env() -> Tuple[bool, List[str]]:
     missing = []
     if not STRIPE_API_KEY:
@@ -278,27 +267,103 @@ def _require_checkout_env() -> Tuple[bool, List[str]]:
         missing.append("CHECKOUT_CANCEL_URL")
     return (len(missing) == 0, missing)
 
-
-def _compose_initial_snapshot(user_id: str, ndcs: List[str]) -> str:
-    lines = ["Glitch — Initial snapshot", f"User: {user_id}", ""]
-    if not ndcs:
-        lines.append("No watchlisted NDCs.")
-        return "\n".join(lines)
 # -----------------------------------------------------------------------------
-# Alert rendering + name resolution (Milestone D/E foundations)
-#
-# Design goals:
-# - Presentation only (no business logic / eligibility decisions)
-# - Deterministic, versioned, cacheable name resolution (best-effort)
-# - Alerts never wait on name resolution (non-blocking by design)
+# Operator auth (P0)
 # -----------------------------------------------------------------------------
+def _request_id() -> str:
+    # Prefer upstream request id if present; else deterministic-ish.
+    rid = request.headers.get("X-Cloud-Trace-Context", "") or request.headers.get("X-Request-Id", "")
+    rid = rid.split("/")[0].strip()
+    if rid:
+        return rid
+    # fallback
+    return _sha256_hex(f"{request.path}|{datetime.datetime.utcnow().isoformat()}")[:16]
 
+def require_operator_auth(fn):
+    """
+    P0: Protect operator endpoints using Google OIDC ID tokens.
+
+    Env:
+      - OPERATOR_AUDIENCE: exact audience (typically canonical Cloud Run URL)
+      - ALLOWED_OPERATOR_EMAILS: comma-separated allowlist of token 'email' claims
+    """
+    @wraps(fn)
+    def _wrapped(*args, **kwargs):
+        rid = _request_id()
+        aud = (_env("OPERATOR_AUDIENCE") or "").strip()
+        allowed_raw = (_env("ALLOWED_OPERATOR_EMAILS") or "").strip()
+
+        if not aud or not allowed_raw:
+            log.info("operator_auth outcome=fail reason=missing_env path=%s request_id=%s", request.path, rid)
+            return jsonify({"ok": False, "error": "operator_auth_not_configured"}), 403
+
+        allowed_emails = {x.strip() for x in allowed_raw.split(",") if x.strip()}
+        authz = request.headers.get("Authorization", "").strip()
+        if not authz.startswith("Bearer "):
+            log.info("operator_auth outcome=fail reason=missing_bearer path=%s request_id=%s", request.path, rid)
+            return jsonify({"ok": False, "error": "missing_bearer"}), 401
+
+        token = authz.split(" ", 1)[1].strip()
+        try:
+            req = grequests.Request()
+            claims = google_id_token.verify_oauth2_token(token, req, audience=aud)
+
+            iss = str(claims.get("iss") or "")
+            if iss not in ("https://accounts.google.com", "accounts.google.com"):
+                log.info("operator_auth outcome=fail reason=bad_issuer iss=%s path=%s request_id=%s", iss, request.path, rid)
+                return jsonify({"ok": False, "error": "bad_issuer"}), 401
+
+            email = (claims.get("email") or "").strip()
+            if not email or email not in allowed_emails:
+                log.info("operator_auth outcome=fail reason=email_not_allowed email=%s path=%s request_id=%s", email, request.path, rid)
+                return jsonify({"ok": False, "error": "email_not_allowed"}), 403
+
+            log.info("operator_auth outcome=pass email=%s path=%s request_id=%s", email, request.path, rid)
+            return fn(*args, **kwargs)
+
+        except Exception as e:
+            log.info("operator_auth outcome=fail reason=token_invalid err=%s path=%s request_id=%s", str(e), request.path, rid)
+            return jsonify({"ok": False, "error": "token_invalid"}), 401
+
+    return _wrapped
+
+# -----------------------------------------------------------------------------
+# Optional/legacy welcome SMS helper
+# -----------------------------------------------------------------------------
+WELCOME_SMS = (
+    "Welcome to Glitch. You will receive shortage alerts for your watchlist.\n\n"
+    "Reply STOP to unsubscribe anytime."
+)
+
+# Optional/legacy helper:
+# Not used in the main activation flow (Stripe webhook sends initial snapshot via _send_message_best_effort).
+# Kept for manual/dev onboarding only.
+def maybe_send_welcome_sms(phone_e164: str) -> bool:
+    if not phone_e164:
+        return False
+
+    tw_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    tw_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    tw_from = os.environ.get("TWILIO_FROM_NUMBER")
+    if not (tw_sid and tw_token and tw_from):
+        return False
+
+    try:
+        TwilioClient(tw_sid, tw_token).messages.create(
+            to=phone_e164,
+            from_=tw_from,
+            body=WELCOME_SMS,
+        )
+        return True
+    except Exception:
+        return False
+
+# -----------------------------------------------------------------------------
+# Alert rendering + deterministic name resolution (best-effort, cacheable)
+# -----------------------------------------------------------------------------
 NAME_RESOLUTION_VERSION = (os.environ.get("NAME_RESOLUTION_VERSION") or "v1").strip() or "v1"
 
 def _shortage_get_by_ndc(ndc_digits: str) -> Tuple[bool, Dict[str, Any]]:
-    """Best-effort deterministic fetch of a shortage record.
-    Prefers document id == ndc_digits, falls back to the legacy query.
-    """
     ndc_digits = (ndc_digits or "").strip()
     if not ndc_digits:
         return False, {}
@@ -309,7 +374,7 @@ def _shortage_get_by_ndc(ndc_digits: str) -> Tuple[bool, Dict[str, Any]]:
     except Exception:
         pass
 
-    # Legacy fallback (older docs may not use ndc as doc id)
+    # Legacy fallback
     try:
         q = (
             db.collection("drug_shortages")
@@ -326,15 +391,6 @@ def _shortage_get_by_ndc(ndc_digits: str) -> Tuple[bool, Dict[str, Any]]:
     return False, {}
 
 def _resolve_name_best_effort(ndc_digits: str, shortage_doc: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Deterministic name resolution pipeline (best-effort, cacheable, versioned).
-
-    Returns:
-      {"name": str, "source": str, "version": str}
-
-    Notes:
-    - Alerts MUST NOT block on this. All failures fall back to shortage fields or "unknown".
-    - Cache key is versioned to allow improvements without breaking determinism.
-    """
     ndc_digits = (ndc_digits or "").strip()
     shortage_doc = shortage_doc or {}
     fallback = (shortage_doc.get("name") or shortage_doc.get("drug_name") or "").strip() or "unknown"
@@ -351,14 +407,15 @@ def _resolve_name_best_effort(ndc_digits: str, shortage_doc: Optional[Dict[str, 
             if nm:
                 return {"name": nm, "source": d.get("source") or "cache", "version": NAME_RESOLUTION_VERSION}
     except Exception:
-        # Never block alerts on cache reads
-        pass
+        pass  # never block
 
-    # Deterministic build (v1): use shortage doc fields only (no external calls)
     resolved = fallback
-    out = {"name": resolved, "source": "shortage_doc" if resolved != "unknown" else "fallback", "version": NAME_RESOLUTION_VERSION}
+    out = {
+        "name": resolved,
+        "source": "shortage_doc" if resolved != "unknown" else "fallback",
+        "version": NAME_RESOLUTION_VERSION,
+    }
 
-    # Best-effort cache write (never blocks)
     try:
         db.collection(cache_coll).document(ndc_digits).set(
             {
@@ -376,7 +433,6 @@ def _resolve_name_best_effort(ndc_digits: str, shortage_doc: Optional[Dict[str, 
     return out
 
 def _render_instant_alert(ndc_digits: str, shortage_doc: Dict[str, Any], event: Dict[str, Any]) -> str:
-    """Instant alert rendering (presentation only)."""
     ndc_digits = (ndc_digits or "").strip()
     status = (shortage_doc.get("status") or shortage_doc.get("current_status") or "unknown").strip()
     prev_status = (event.get("prev_status") or "").strip()
@@ -387,11 +443,7 @@ def _render_instant_alert(ndc_digits: str, shortage_doc: Dict[str, Any], event: 
     headline = "🚨 GLITCH ALERT"
     line1 = f"Drug: {name}"
     line2 = f"NDC: {ndc_digits}" if ndc_digits else "NDC: unknown"
-    if prev_status:
-        line3 = f"Status: {prev_status} → {status}"
-    else:
-        line3 = f"Status: {status}"
-
+    line3 = f"Status: {prev_status} → {status}" if prev_status else f"Status: {status}"
     footer = "\n\nReply STOP to unsubscribe.\n— Glitch"
     return "\n".join([headline, "━━━━━━━━━━━━━━━━━━━━", line1, line2, line3, f"Reason: {reason}"]) + footer
 
@@ -401,7 +453,6 @@ def _week_key_utc(dt: Optional[datetime.datetime] = None) -> str:
     return f"{iso.year}-W{int(iso.week):02d}"
 
 def _render_weekly_summary(artifact: Dict[str, Any]) -> str:
-    """Weekly summary rendering (confidence reset; presentation only)."""
     observed = int(artifact.get("observed") or 0)
     body_lines = artifact.get("lines") or []
     if not isinstance(body_lines, list):
@@ -432,74 +483,61 @@ def _write_weekly_summary_artifact(week_key: str, observed: int, lines_list: Lis
     try:
         db.collection("weekly_summaries").document(week_key).set(artifact, merge=True)
     except Exception:
-        # Artifact writes are best-effort; summary sending still proceeds
         pass
     return artifact
 
+def _compose_initial_snapshot(user_id: str, ndcs: List[str]) -> str:
+    lim = _safe_limits_or_none()
+    cap = 20
+    if lim is not None:
+        cap = min(50, max(5, int(lim.get("WEEKLY_RECAP_MAX_ITEMS") or 20)))
 
+    lines = ["Glitch — Initial snapshot", f"User: {user_id}", ""]
+    if not ndcs:
+        lines.append("No watchlisted NDCs.")
+        return "\n".join(lines)
+
+    shown = 0
     for ndc in ndcs:
-        status = "unknown"
-        try:
-            q = (
-                db.collection("drug_shortages")
-                .where("ndc_digits", "==", ndc)
-                .limit(1)
-                .stream()
-            )
-            doc = next(q, None)
-            if doc:
-                data = doc.to_dict() or {}
-                status = data.get("status") or data.get("current_status") or "unknown"
-        except Exception:
-            pass
-        lines.append(f"- {ndc}: {status}")
+        if shown >= cap:
+            break
+        exists, doc = _shortage_get_by_ndc(ndc)
+        status = (doc.get("status") or doc.get("current_status") or "unknown").strip() if exists else "unknown"
+        resolved = _resolve_name_best_effort(ndc, doc if exists else {})
+        name = (resolved.get("name") or "unknown").strip()
+        lines.append(f"- {name} ({ndc}): {status}")
+        shown += 1
+
+    if len(ndcs) > shown:
+        lines.append(f"...and {len(ndcs) - shown} more.")
 
     return "\n".join(lines)
 
-
-def _send_message_best_effort(user_doc: dict, text: str, ndc: str | None = None) -> bool:
+# -----------------------------------------------------------------------------
+# Central notification send (billing + eligibility + rate limits)
+# -----------------------------------------------------------------------------
+def _send_message_best_effort(user_doc: dict, text: str, ndc: Optional[str] = None) -> bool:
     """
-    Central notification send.
     Gates (fail-closed):
-      1) Billing eligibility: users/{user_id}.status must be "active"
-      2) PAYMENTS_ENABLED must be true (env gate)
+      1) users.status must be "active"
+      2) PAYMENTS_ENABLED must be true (global operator kill switch)
       3) Rate limits (Milestone C.2):
          - MAX_ALERTS_PER_DAY (per user per day)
          - MAX_ALERTS_PER_NDC_PER_DAY (if ndc provided)
-
-    Returns:
-      True  => passed eligibility + quota reservation (we attempted to send via at least one configured channel)
-      False => fail-closed skipped (ineligible / over limit / missing identifiers)
     """
     user_doc = user_doc or {}
     user_id = (user_doc.get("user_id") or "").strip()
     status = user_doc.get("status")
 
-    # If status not provided, fetch from Firestore (best-effort)
-    if status is None and user_id:
-        try:
-            snap = db.collection("users").document(user_id).get()
-            if snap.exists:
-                status = (snap.to_dict() or {}).get("status")
-        except Exception:
-            status = None
-
+    # Removed dead fallback fetch: callers MUST pass status (defensive, reduces reads).
     if status != "active":
         log.info("notify_skip_ineligible user_id=%s status=%s", str(user_id), str(status))
         return False
 
-    # PAYMENTS_ENABLED gate (fail-closed)
-    def _bool_env(v: str | None) -> bool:
-        if v is None:
-            return False
-        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-    payments_enabled = _bool_env(os.environ.get("PAYMENTS_ENABLED"))
-    if not payments_enabled:
-        log.info("notify_skip_billing_disabled user_id=%s payments_enabled=%s", str(user_id), str(payments_enabled))
+    if not _bool_env("PAYMENTS_ENABLED", False):
+        log.info("notify_skip_billing_disabled user_id=%s payments_enabled=false", str(user_id))
         return False
 
-    # Rate limits (fail-closed)
     if not user_id:
         log.info(
             "notify_skip_over_limit user_id=%s limit_total=%s observed_total=%s limit_ndc=%s observed_ndc=%s ndc=%s channel=%s fail_closed=true",
@@ -542,7 +580,7 @@ def _send_message_best_effort(user_doc: dict, text: str, ndc: str | None = None)
                 (resp.text[:200] if hasattr(resp, "text") else "na"),
             )
         except Exception as e:
-            log.error("Telegram send failed: %s", str(e))
+            log.error("telegram_send_failed user_id=%s err=%s", str(user_id), str(e))
 
     # Twilio
     tw_sid = _env("TWILIO_ACCOUNT_SID")
@@ -552,23 +590,20 @@ def _send_message_best_effort(user_doc: dict, text: str, ndc: str | None = None)
     if tw_sid and tw_token and tw_from and phone:
         attempted_any = True
         try:
-            from twilio.rest import Client
-            Client(tw_sid, tw_token).messages.create(
+            TwilioClient(tw_sid, tw_token).messages.create(
                 to=phone,
                 from_=tw_from,
                 body=text,
             )
         except Exception as e:
-            log.error("Twilio send failed: %s", str(e))
+            log.error("twilio_send_failed user_id=%s err=%s", str(user_id), str(e))
 
     return attempted_any
 
-def _upsert_user_and_watchlist(
-    phone_e164: str,
-    email: Optional[str],
-    ndcs: List[str],
-    etype: str,
-) -> str:
+# -----------------------------------------------------------------------------
+# User + watchlist upsert (activation)
+# -----------------------------------------------------------------------------
+def _upsert_user_and_watchlist(phone_e164: str, email: Optional[str], ndcs: List[str], etype: str) -> str:
     user_id = _user_id_from_phone(phone_e164)
     user_ref = db.collection("users").document(user_id)
     existing = user_ref.get().to_dict() or {}
@@ -601,8 +636,6 @@ def _upsert_user_and_watchlist(
 
     return user_id
 
-
-
 # -----------------------------------------------------------------------------
 # UI CORS (Milestone E.0) — allow browser embedding for /ui/* only
 # -----------------------------------------------------------------------------
@@ -613,7 +646,6 @@ def _is_ui_path(path: str) -> bool:
 
 @app.before_request
 def _ui_cors_preflight():
-    # Handle browser preflight for /ui/* only.
     if _is_ui_path(request.path) and request.method == "OPTIONS":
         resp = make_response("", 204)
         resp.headers["Access-Control-Allow-Origin"] = _UI_CORS_ALLOW_ORIGIN
@@ -626,155 +658,33 @@ def _ui_cors_preflight():
 
 @app.after_request
 def _ui_cors_headers(resp):
-    # Add CORS headers for /ui/* responses only.
     if _is_ui_path(request.path):
         resp.headers["Access-Control-Allow-Origin"] = _UI_CORS_ALLOW_ORIGIN
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
+
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-
-
-@app.route("/__dev/send_welcome", methods=["POST"])
-def __dev_send_welcome():
-    """
-    DEV ONLY. Requires ALLOW_DEV_ENDPOINTS=true.
-    Body: {"user_id":"u_..."}
-    Sends idempotent welcome SMS to user's phone_e164.
-    Always returns JSON (including on errors) to avoid Cloud Shell log digging.
-    """
-    try:
-        allow = os.environ.get("ALLOW_DEV_ENDPOINTS", "false").lower() == "true"
-        if not allow:
-            return jsonify({"ok": False, "error": "dev_endpoints_disabled"}), 403
-
-        body = request.get_json(silent=True) or {}
-        user_id = body.get("user_id")
-        if not user_id:
-            return jsonify({"ok": False, "error": "missing_user_id"}), 400
-
-        # Twilio env vars (must exist in Cloud Run)
-        tw_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-        tw_token = os.environ.get("TWILIO_AUTH_TOKEN")
-        twilio_number = os.environ.get("TWILIO_FROM_NUMBER") or os.environ.get("TWILIO_NUMBER")
-
-        if not (tw_sid and tw_token and twilio_number):
-            return jsonify({
-                "ok": False,
-                "error": "missing_twilio_env",
-                "have": {
-                    "TWILIO_ACCOUNT_SID": bool(tw_sid),
-                    "TWILIO_AUTH_TOKEN": bool(tw_token),
-                    "TWILIO_FROM_NUMBER_or_TWILIO_NUMBER": bool(twilio_number),
-                }
-            }), 500
-
-        user_ref = db.collection("users").document(user_id)
-        snap = user_ref.get()
-        if not snap.exists:
-            return jsonify({"ok": False, "error": "user_not_found", "user_id": user_id}), 404
-
-        phone = (snap.to_dict() or {}).get("phone_e164")
-        if not phone:
-            return jsonify({"ok": False, "error": "missing_phone_e164", "user_id": user_id}), 400
-
-        res = maybe_send_welcome_sms(
-            db=db,
-            user_ref=user_ref,
-            phone_e164=phone,
-            tw_sid=tw_sid,
-            tw_token=tw_token,
-            twilio_number=twilio_number,
-        )
-        return jsonify({"ok": True, "user_id": user_id, "phone_e164": phone, **res})
-    except Exception as e:
-        try:
-            log.exception("dev_send_welcome_failed")
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-
-    body = request.get_json(silent=True) or {}
-    user_id = body.get("user_id")
-    if not user_id:
-        return jsonify({"ok": False, "error": "missing_user_id"}), 400
-
-    # Twilio env vars (must already exist in Cloud Run)
-    tw_sid = os.environ["TWILIO_ACCOUNT_SID"]
-    tw_token = os.environ["TWILIO_AUTH_TOKEN"]
-    twilio_number = os.environ["TWILIO_FROM_NUMBER"]
-
-    user_ref = db.collection("users").document(user_id)
-    snap = user_ref.get()
-    if not snap.exists:
-        return jsonify({"ok": False, "error": "user_not_found", "user_id": user_id}), 404
-
-    phone = (snap.to_dict() or {}).get("phone_e164")
-    if not phone:
-        return jsonify({"ok": False, "error": "missing_phone_e164", "user_id": user_id}), 400
-    try:
-        res = maybe_send_welcome_sms(
-            db=db,
-            user_ref=user_ref,
-            phone_e164=phone,
-            tw_sid=tw_sid,
-            tw_token=tw_token,
-            twilio_number=twilio_number,
-        )
-        return jsonify({"ok": True, "user_id": user_id, "phone_e164": phone, **res})
-    except Exception as e:
-        try:
-            log.exception("dev_send_welcome_failed")
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": str(e), "user_id": user_id}), 500
-
-
-
-@app.route("/__dev/diag", methods=["GET"])
-def __dev_diag():
-    allow = os.environ.get("ALLOW_DEV_ENDPOINTS", "false").lower() == "true"
-    if not allow:
-        return jsonify({"ok": False, "error": "dev_endpoints_disabled"}), 403
-
-    keys = [
-        "K_SERVICE","K_REVISION","ALLOW_DEV_ENDPOINTS",
-        "TWILIO_ACCOUNT_SID","TWILIO_AUTH_TOKEN","TWILIO_FROM_NUMBER","TWILIO_NUMBER",
-        "PAYMENTS_ENABLED"
-    ]
-    present = {k: bool(os.environ.get(k)) for k in keys}
-    return jsonify({"ok": True, "present": present, "k_revision": os.environ.get("K_REVISION")}), 200
-
-
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"ok": True, "service": APP_NAME}), 200
 
-
+# Health checks:
+# We expose BOTH /healthz and /healthz/ because different monitors/integrations
+# may normalize trailing slashes differently. Keep both to avoid false 404s.
 @app.route("/healthz", methods=["GET"])
 @app.route("/healthz/", methods=["GET"])
 def healthz():
-    log.info("healthz_hit path=%s host=%s", request.path, request.host)
     return jsonify({"ok": True}), 200
-
 
 @app.route("/ui/status", methods=["GET"])
 @app.route("/ui/status/", methods=["GET"])
 def ui_status():
-    # Read-only transparency endpoint. No secrets. No Firestore. No user data.
     k_service = os.environ.get("K_SERVICE")
     k_revision = os.environ.get("K_REVISION")
-    now_utc = _now_iso()
-
-    def _bool(v, default=False):
-        if v is None:
-            return default
-        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
     def _int(v, default=None):
         try:
@@ -782,30 +692,21 @@ def ui_status():
         except Exception:
             return default
 
-    # Limits are surfaced as configured (or null if missing).
     limits = {
         "MAX_WATCHLIST_ITEMS": _int(os.environ.get("MAX_WATCHLIST_ITEMS")),
         "MAX_ALERTS_PER_DAY": _int(os.environ.get("MAX_ALERTS_PER_DAY")),
         "MAX_ALERTS_PER_NDC_PER_DAY": _int(os.environ.get("MAX_ALERTS_PER_NDC_PER_DAY")),
         "WEEKLY_RECAP_MAX_ITEMS": _int(os.environ.get("WEEKLY_RECAP_MAX_ITEMS")),
-        "FAIL_CLOSED_LIMITS": _bool(os.environ.get("FAIL_CLOSED_LIMITS")),
+        "FAIL_CLOSED_LIMITS": _bool_env("FAIL_CLOSED_LIMITS", True),
     }
 
     payload = {
         "ok": True,
         "service": APP_NAME,
-        "cloud_run": {
-            "K_SERVICE": k_service,
-            "K_REVISION": k_revision,
-        },
-        "now_utc": now_utc,
-        "health": {
-            "canonical_path": "/healthz/",
-            "note": "Use /healthz/ (trailing slash) for monitoring.",
-        },
-        "billing": {
-            "PAYMENTS_ENABLED": _bool(os.environ.get("PAYMENTS_ENABLED")),
-        },
+        "cloud_run": {"K_SERVICE": k_service, "K_REVISION": k_revision},
+        "now_utc": _now_iso(),
+        "health": {"canonical_path": "/healthz/", "note": "Use /healthz/ (trailing slash) for monitoring."},
+        "billing": {"PAYMENTS_ENABLED": _bool_env("PAYMENTS_ENABLED", False)},
         "limits": limits,
         "roll_marker_present": bool(os.environ.get("ROLL_MARKER")),
         "host": {
@@ -817,24 +718,15 @@ def ui_status():
     }
     return jsonify(payload), 200
 
-
 @app.route("/ui/user/status", methods=["POST"])
 @app.route("/ui/user/status/", methods=["POST"])
 def ui_user_status():
-    # Read-only, fail-closed user transparency. No secrets. No writes.
     payload = request.get_json(force=True, silent=True) or {}
     phone = (payload.get("phone_e164") or "").strip()
-
     if not phone or not phone.startswith("+"):
         return jsonify({"ok": False, "error": "invalid_phone"}), 400
 
     user_id = _user_id_from_phone(phone)
-
-    # Reuse the same env-parsed limits shape as /ui/status (kept inline to avoid refactor).
-    def _bool(v, default=False):
-        if v is None:
-            return default
-        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
     def _int(v, default=None):
         try:
@@ -847,10 +739,9 @@ def ui_user_status():
         "MAX_ALERTS_PER_DAY": _int(os.environ.get("MAX_ALERTS_PER_DAY")),
         "MAX_ALERTS_PER_NDC_PER_DAY": _int(os.environ.get("MAX_ALERTS_PER_NDC_PER_DAY")),
         "WEEKLY_RECAP_MAX_ITEMS": _int(os.environ.get("WEEKLY_RECAP_MAX_ITEMS")),
-        "FAIL_CLOSED_LIMITS": _bool(os.environ.get("FAIL_CLOSED_LIMITS")),
+        "FAIL_CLOSED_LIMITS": _bool_env("FAIL_CLOSED_LIMITS", True),
     }
 
-    # Firestore reads (fail-closed).
     try:
         user_ref = db.collection("users").document(user_id)
         snap = user_ref.get()
@@ -860,12 +751,8 @@ def ui_user_status():
         created_at = user_doc.get("created_at")
         updated_at = user_doc.get("updated_at")
 
-        # Watchlist count + deterministic preview (cap 10).
         preview = []
         count = 0
-
-        # Prefer stream over count() for compatibility; cap scan at 200 to avoid abuse.
-        # This is transparency only; not used for enforcement.
         for i, doc in enumerate(user_ref.collection("watchlist_items").stream()):
             count += 1
             if len(preview) < 10:
@@ -890,12 +777,7 @@ def ui_user_status():
             "created_at": created_at,
             "updated_at": updated_at,
         },
-        "watchlist": {
-            "count": count,
-            "items_preview": preview,
-            "preview_cap": 10,
-            "scan_cap": 200,
-        },
+        "watchlist": {"count": count, "items_preview": preview, "preview_cap": 10, "scan_cap": 200},
         "limits": limits,
         "notes": [
             "If status is not active, notifications are skipped server-side.",
@@ -904,13 +786,9 @@ def ui_user_status():
     }
     return jsonify(out), 200
 
-
-
-
 @app.route("/ui/user/diagnostics", methods=["POST"])
 @app.route("/ui/user/diagnostics/", methods=["POST"])
 def ui_user_diagnostics():
-    # Read-only, fail-closed: explain why an alert may not fire (eligibility gates only).
     payload = request.get_json(force=True, silent=True) or {}
     phone = (payload.get("phone_e164") or "").strip()
     ndc_raw = (payload.get("ndc_digits") or "").strip()
@@ -928,24 +806,20 @@ def ui_user_diagnostics():
     now_utc = _now_iso()
     day = _today_yyyymmdd_utc()
 
-    # Env snapshot (kept inline to avoid refactor)
-    def _bool(v, default=False):
-        if v is None:
-            return default
-        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+    payments_enabled = _bool_env("PAYMENTS_ENABLED", False)
+    max_total = os.environ.get("MAX_ALERTS_PER_DAY")
+    max_ndc = os.environ.get("MAX_ALERTS_PER_NDC_PER_DAY")
+    fail_closed_limits = _bool_env("FAIL_CLOSED_LIMITS", True)
 
-    def _int(v, default=None):
+    def _int(v):
         try:
             return int(str(v).strip())
         except Exception:
-            return default
+            return None
 
-    payments_enabled = _bool(os.environ.get("PAYMENTS_ENABLED"))
-    max_total = _int(os.environ.get("MAX_ALERTS_PER_DAY"))
-    max_ndc = _int(os.environ.get("MAX_ALERTS_PER_NDC_PER_DAY"))
-    fail_closed_limits = _bool(os.environ.get("FAIL_CLOSED_LIMITS"))
+    max_total_i = _int(max_total)
+    max_ndc_i = _int(max_ndc)
 
-    # Firestore reads (fail-closed).
     try:
         user_ref = db.collection("users").document(user_id)
         snap = user_ref.get()
@@ -957,7 +831,6 @@ def ui_user_diagnostics():
         updated_at = user_doc.get("updated_at")
         user_active = (status == "active")
 
-        # Watchlist membership check (only if ndc provided). Cap scan to avoid abuse.
         ndc_in_watchlist = None
         watchlist_count = 0
         if ndc:
@@ -973,7 +846,6 @@ def ui_user_diagnostics():
             if i >= 199:
                 break
 
-        # Rate limit doc read (treat missing as 0 used).
         rl_ref = _rate_limit_doc_ref(user_id, day)
         rl_snap = rl_ref.get()
         rl_doc_exists = bool(rl_snap.exists)
@@ -984,25 +856,32 @@ def ui_user_diagnostics():
         if ndc:
             by_ndc = rl.get("alerts_sent_by_ndc") or {}
             alerts_sent_for_ndc_today = int(by_ndc.get(ndc) or 0)
-        # Deterministic shortage existence check (only if ndc provided).
+
         shortage_exists = None
         shortage_status = None
         shortage_doc_id = None
         if ndc:
             shortage_exists = False
-            q = (
-                db.collection("drug_shortages")
-                .where("ndc_digits", "==", ndc)
-                .limit(1)
-                .stream()
-            )
-            doc = next(q, None)
-            if doc:
+            # deterministic: prefer canonical doc id, then fallback query
+            snap2 = db.collection("drug_shortages").document(ndc).get()
+            if snap2.exists:
                 shortage_exists = True
-                shortage_doc_id = doc.id
-                data = doc.to_dict() or {}
-                shortage_status = data.get("status") or data.get("current_status") or "unknown"
-
+                shortage_doc_id = ndc
+                d2 = snap2.to_dict() or {}
+                shortage_status = d2.get("status") or d2.get("current_status") or "unknown"
+            else:
+                q = (
+                    db.collection("drug_shortages")
+                    .where("ndc_digits", "==", ndc)
+                    .limit(1)
+                    .stream()
+                )
+                doc2 = next(q, None)
+                if doc2:
+                    shortage_exists = True
+                    shortage_doc_id = doc2.id
+                    d2 = doc2.to_dict() or {}
+                    shortage_status = d2.get("status") or d2.get("current_status") or "unknown"
 
     except Exception as e:
         log.error("ui_user_diagnostics_firestore_error user_id=%s err=%s fail_closed=true", str(user_id), str(e))
@@ -1013,7 +892,6 @@ def ui_user_diagnostics():
     def _add(code: str, passed: bool, detail: str):
         checks.append({"code": code, "pass": bool(passed), "detail": detail})
 
-    # Decision order: first failing check wins.
     eligible = True
     primary_code = "ELIGIBLE"
     primary_human = "User is active and limits not exceeded."
@@ -1043,34 +921,32 @@ def ui_user_diagnostics():
             primary_code = "WATCHLIST_MATCH"
             primary_human = "This NDC is not in the user's watchlist. Alerts would not fire."
 
-    if max_total is None:
+    if max_total_i is None:
         _add("DAILY_LIMIT", True, "Daily limit env missing; enforcement may fail-closed server-side.")
     else:
-        _add("DAILY_LIMIT", (alerts_sent_today < int(max_total)), f"{alerts_sent_today}/{int(max_total)} used today.")
-        if eligible and alerts_sent_today >= int(max_total):
+        _add("DAILY_LIMIT", (alerts_sent_today < int(max_total_i)), f"{alerts_sent_today}/{int(max_total_i)} used today.")
+        if eligible and alerts_sent_today >= int(max_total_i):
             eligible = False
             primary_code = "DAILY_LIMIT"
             primary_human = "Daily alert limit exceeded. Alerts are skipped for today."
 
     if ndc:
-        if max_ndc is None:
+        if max_ndc_i is None:
             _add("PER_NDC_LIMIT", True, "Per-NDC limit env missing; enforcement may fail-closed server-side.")
         else:
             obs = int(alerts_sent_for_ndc_today or 0)
-            _add("PER_NDC_LIMIT", (obs < int(max_ndc)), f"{obs}/{int(max_ndc)} used today for this NDC.")
-            if eligible and obs >= int(max_ndc):
+            _add("PER_NDC_LIMIT", (obs < int(max_ndc_i)), f"{obs}/{int(max_ndc_i)} used today for this NDC.")
+            if eligible and obs >= int(max_ndc_i):
                 eligible = False
                 primary_code = "PER_NDC_LIMIT"
                 primary_human = "Per-NDC alert limit exceeded. Alerts are skipped for this NDC today."
 
-    # Shortage existence check (only if ndc provided). Placed last in decision order.
     if ndc:
         _add("NO_MATCHING_SHORTAGE", bool(shortage_exists), "Matching shortage record found." if shortage_exists else "No matching shortage record found.")
         if eligible and not shortage_exists:
             eligible = False
             primary_code = "NO_MATCHING_SHORTAGE"
             primary_human = "No current shortage record matches this NDC. Alerts would not fire."
-
 
     out = {
         "ok": True,
@@ -1090,8 +966,8 @@ def ui_user_diagnostics():
         },
         "limits": {
             "payments_enabled": payments_enabled,
-            "max_alerts_per_day": max_total,
-            "max_alerts_per_ndc_per_day": max_ndc,
+            "max_alerts_per_day": max_total_i,
+            "max_alerts_per_ndc_per_day": max_ndc_i,
             "fail_closed_limits": fail_closed_limits,
         },
         "shortage": {
@@ -1111,13 +987,11 @@ def ui_user_diagnostics():
         },
         "checks": checks,
         "notes": [
-            "This endpoint explains eligibility gates (user/billing/watchlist/limits) only.",
-            "It does not prove a shortage exists for an NDC; shortage matching is separate from eligibility.",
+            "This endpoint explains eligibility gates (user/billing/watchlist/limits).",
             "Rate limit doc missing is treated as 0 used; Firestore errors fail-closed (503).",
         ],
     }
     return jsonify(out), 200
-
 
 @app.route("/create_checkout_session", methods=["POST"])
 def create_checkout_session():
@@ -1128,16 +1002,19 @@ def create_checkout_session():
     payload = request.get_json(force=True, silent=True) or {}
     phone = (payload.get("phone_e164") or "").strip()
     email = (payload.get("email") or "").strip() or None
+
+    if not phone.startswith("+"):
+        return jsonify({"error": "invalid_phone"}), 400
+
     try:
         ndcs = _parse_watchlist_ndcs(payload.get("watchlist_ndcs"))
         _enforce_watchlist_limit(_user_id_from_phone(phone), ndcs, "checkout_session_create")
     except Exception as e:
-        log.info("watchlist_parse_failed user_id=%s reason=%s source=%s fail_closed=true",
-                 str(_user_id_from_phone(phone)), str(e), "checkout_session_create")
+        log.info(
+            "watchlist_parse_failed user_id=%s reason=%s source=%s fail_closed=true",
+            str(_user_id_from_phone(phone)), str(e), "checkout_session_create"
+        )
         return jsonify({"error": "watchlist_invalid_or_over_limit"}), 400
-
-    if not phone.startswith("+"):
-        return jsonify({"error": "invalid_phone"}), 400
 
     stripe.api_key = STRIPE_API_KEY
 
@@ -1157,10 +1034,8 @@ def create_checkout_session():
 
     return jsonify({"url": session.url}), 200
 
-
 @app.route("/stripe_webhook", methods=["POST"])
 def stripe_webhook():
-    # Fail-closed unless explicitly enabled
     if not PAYMENTS_ENABLED:
         return "stripe_not_configured", 501
 
@@ -1189,7 +1064,7 @@ def stripe_webhook():
         created = event.get("created")
         obj = (event.get("data") or {}).get("object") or {}
 
-        # Idempotency: if already processed, exit 200 no-op
+        # Idempotency
         if event_id:
             idem_ref = db.collection("processed_stripe_events").document(event_id)
             if idem_ref.get().exists:
@@ -1202,23 +1077,7 @@ def stripe_webhook():
                 "received_at": _now_iso(),
             }, merge=True)
 
-        # Helper: set user billing status deterministically
-        def _set_user_status(user_id: str, status: str, reason_type: str):
-            if not user_id:
-                return
-            db.collection("users").document(user_id).set({
-                "status": status,
-                "billing_disabled_at": _now_iso(),
-                "stripe_last_event": reason_type,
-                "stripe_last_event_id": event_id,
-                "updated_at": _now_iso(),
-            }, merge=True)
-
-        # Try to map Stripe objects -> user_id using client_reference_id (preferred)
-        # For checkout.session.completed, we already set client_reference_id=user_id
         user_id = (obj.get("client_reference_id") or "").strip()
-
-        # Common Stripe identifiers for logs only
         customer = obj.get("customer")
         subscription = obj.get("subscription")
 
@@ -1227,33 +1086,38 @@ def stripe_webhook():
             event_id, etype, user_id, str(customer), str(subscription)
         )
 
+        def _set_user_status(uid: str, status: str, reason_type: str):
+            if not uid:
+                return
+            db.collection("users").document(uid).set({
+                "status": status,
+                "billing_disabled_at": _now_iso(),
+                "stripe_last_event": reason_type,
+                "stripe_last_event_id": event_id,
+                "updated_at": _now_iso(),
+            }, merge=True)
+
         if etype == "checkout.session.completed":
             md = obj.get("metadata") or {}
             phone = (md.get("phone_e164") or "").strip()
             email = (md.get("email") or obj.get("customer_email"))
             ndcs = _parse_watchlist_ndcs(md.get("watchlist_ndcs"))
-            try:
-                _enforce_watchlist_limit(user_id or _user_id_from_phone(phone), ndcs, "stripe_webhook_activation")
-            except Exception as e:
-                log.info("watchlist_parse_failed user_id=%s reason=%s source=%s fail_closed=true",
-                         str(user_id or _user_id_from_phone(phone)), str(e), "stripe_webhook_activation")
-                raise
 
+            _enforce_watchlist_limit(user_id or _user_id_from_phone(phone), ndcs, "stripe_webhook_activation")
             if not phone:
                 raise ValueError("missing metadata.phone_e164")
 
-            # user_id derived from phone is canonical for creation (matches prior behavior)
             user_id = _upsert_user_and_watchlist(phone, email, ndcs, etype)
 
             user_ref = db.collection("users").document(user_id)
             user_doc = user_ref.get().to_dict() or {}
+            user_doc = {**user_doc, "user_id": user_id}
 
             if not user_doc.get("initial_snapshot_sent_at"):
                 msg = _compose_initial_snapshot(user_id, ndcs)
-                _send_message_best_effort({**user_doc, "user_id": user_id}, msg)
+                _send_message_best_effort(user_doc, msg, ndc=None)
                 user_ref.set({"initial_snapshot_sent_at": _now_iso()}, merge=True)
 
-            # Ensure active status remains active
             user_ref.set({
                 "status": "active",
                 "stripe_last_event": etype,
@@ -1262,9 +1126,6 @@ def stripe_webhook():
             }, merge=True)
 
         elif etype == "invoice.payment_failed":
-            # Object is an invoice; it may not carry client_reference_id.
-            # We rely on the subscription's metadata for user_id if present, else no-op (fail closed).
-            # Best effort: look up subscription and read metadata.user_id if available.
             uid = user_id
             sub_id = obj.get("subscription")
             try:
@@ -1278,7 +1139,6 @@ def stripe_webhook():
             _set_user_status(uid, "suspended", etype)
 
         elif etype == "customer.subscription.deleted":
-            # Object is a subscription; use metadata.user_id if present
             uid = user_id
             try:
                 smd = (obj.get("metadata") or {})
@@ -1296,23 +1156,110 @@ def stripe_webhook():
         log.error(traceback.format_exc())
         return jsonify({"error": "webhook_handler_error"}), 500
 
-@app.route("/shortage_poll_run", methods=["POST"])
-def shortage_poll_run():
-    """Poll FDA shortage feed, upsert deterministic shortage docs, and emit instant alerts.
-
-    Notes:
-    - This endpoint is intended to be invoked by Cloud Scheduler / Cloud Run job.
-    - Best-effort by design: transient failures return 5xx so scheduler retries.
-    - Rendering is delegated to the Alert Rendering Layer.
+# -----------------------------------------------------------------------------
+# Twilio inbound (P1)
+# -----------------------------------------------------------------------------
+@app.route("/twilio/inbound", methods=["POST"])
+def twilio_inbound():
     """
+    P1: inbound SMS activation (YES).
+    - Verifies X-Twilio-Signature using TWILIO_AUTH_TOKEN (fail-closed)
+    - Idempotently sets users/{user_id}.activated_at when Body == YES
+    - Returns TwiML
+    - Emits exactly one structured log line:
+        inbound_sms request_id=... from=... body_norm=... sig_valid=... action=...
+    """
+    rid = _request_id()
+    tw_token = _env("TWILIO_AUTH_TOKEN")
+    if not tw_token:
+        log.info("inbound_sms request_id=%s from=%s body_norm=%s sig_valid=%s action=%s",
+                 rid, "unknown", "unknown", "false", "missing_env")
+        # do not leak details; Twilio will retry but we prefer fail-closed
+        resp = MessagingResponse()
+        resp.message("Glitch is temporarily unavailable. Please try again later.")
+        return str(resp), 200, {"Content-Type": "application/xml"}
+
+    form = request.form.to_dict(flat=True) if request.form else {}
+    from_phone = (form.get("From") or "").strip()
+    body = (form.get("Body") or "").strip()
+    body_norm = body.upper().strip()
+
+    # Reconstruct the URL Twilio signed (Cloud Run behind proxy)
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+    host = (request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or request.host).split(",")[0].strip()
+    url = f"{proto}://{host}{request.path}"
+
+    sig = request.headers.get("X-Twilio-Signature") or request.headers.get("X-Twilio-Signature".lower()) or ""
+    validator = RequestValidator(tw_token)
+    sig_valid = False
+    try:
+        sig_valid = validator.validate(url, form, sig)
+    except Exception:
+        sig_valid = False
+
+    action = "ignored"
+    try:
+        if not sig_valid:
+            action = "sig_invalid"
+        elif not from_phone:
+            action = "missing_from"
+        else:
+            user_id = _user_id_from_phone(from_phone)
+            user_ref = db.collection("users").document(user_id)
+            snap = user_ref.get()
+            if not snap.exists:
+                action = "user_not_found"
+            else:
+                u = snap.to_dict() or {}
+                # Optional safety: ensure phone matches
+                if (u.get("phone_e164") or "").strip() and (u.get("phone_e164") or "").strip() != from_phone:
+                    action = "phone_mismatch"
+                else:
+                    if body_norm == "YES":
+                        # idempotent activation
+                        if u.get("activated_at"):
+                            action = "already_activated"
+                        else:
+                            user_ref.set({"activated_at": _now_iso(), "updated_at": _now_iso()}, merge=True)
+                            action = "activated_yes"
+                    elif body_norm == "STOP":
+                        action = "stop_received"
+                    else:
+                        action = "non_yes"
+    except Exception:
+        action = "exception"
+
+    log.info(
+        "inbound_sms request_id=%s from=%s body_norm=%s sig_valid=%s action=%s",
+        rid, from_phone or "unknown", body_norm or "empty", str(bool(sig_valid)).lower(), action
+    )
+
+    resp = MessagingResponse()
+    if action == "activated_yes":
+        resp.message("✅ Glitch activated. You’ll only get alerts when shortage status changes for your watchlist.")
+    elif action == "already_activated":
+        resp.message("✅ Glitch is already active for your number.")
+    elif action == "user_not_found":
+        resp.message("We couldn’t find your Glitch account. Please sign up first.")
+    elif action == "sig_invalid":
+        resp.message("Request not authorized.")
+    else:
+        resp.message("OK.")
+
+    return str(resp), 200, {"Content-Type": "application/xml"}
+
+# -----------------------------------------------------------------------------
+# Operator endpoints (protected)
+# -----------------------------------------------------------------------------
+@app.route("/shortage_poll_run", methods=["POST"])
+@require_operator_auth
+def shortage_poll_run():
     lim = _safe_limits_or_none()
     if lim is None:
         return jsonify({"error": "limits_missing_or_invalid"}), 500
 
-    url = (os.environ.get("FDA_SHORTAGE_URL") or "").strip() or "https://www.accessdata.fda.gov/scripts/drugshortages/api/drugshortages.json"
-
     try:
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(FDA_SHORTAGE_URL, timeout=20)
         if getattr(resp, "status_code", 500) != 200:
             return jsonify({"error": "fda_fetch_failed", "status": getattr(resp, "status_code", "na")}), 502
         payload = resp.json()
@@ -1320,22 +1267,19 @@ def shortage_poll_run():
         log.error("shortage_poll_fetch_failed err=%s", str(e))
         return jsonify({"error": "fda_fetch_exception"}), 502
 
-    # Payload shape varies; normalize to list of items.
     items = payload.get("results") if isinstance(payload, dict) else payload
     if not isinstance(items, list):
         return jsonify({"error": "fda_payload_unexpected"}), 502
 
     processed = 0
     changed = 0
-    alerted = 0
-
+    alerted_attempted = 0
     now = datetime.datetime.utcnow()
 
     for it in items:
         if not isinstance(it, dict):
             continue
 
-        # Best-effort extraction (keep deterministic by only using payload fields)
         ndc_raw = (it.get("ndc") or it.get("ndc_digits") or it.get("ndcNumber") or "").strip()
         ndc = _ndc_digits(ndc_raw)
         if not ndc:
@@ -1345,19 +1289,18 @@ def shortage_poll_run():
         status = (it.get("status") or it.get("current_status") or it.get("shortage_status") or "").strip() or "unknown"
         last_updated = it.get("last_updated") or it.get("update_date") or None
 
-        # Load previous state (best-effort)
         prev_exists, prev = _shortage_get_by_ndc(ndc)
         prev_status = (prev.get("status") or prev.get("current_status") or "").strip() if prev_exists else ""
 
-        # Upsert deterministic doc id = ndc (new canonical)
         doc = {
             "ndc_digits": ndc,
             "name": name or prev.get("name") or prev.get("drug_name") or "",
             "status": status,
-            "last_updated": last_updated or now,  # allow timestamp objects; Firestore stores as timestamp
+            "last_updated": last_updated or now,
             "updated_at": _now_iso(),
             "source": "fda_shortages_api",
         }
+
         try:
             db.collection("drug_shortages").document(ndc).set(doc, merge=True)
         except Exception as e:
@@ -1366,7 +1309,6 @@ def shortage_poll_run():
 
         processed += 1
 
-        # Detect meaningful change (status change only for now)
         if prev_status and status and prev_status != status:
             changed += 1
             event = {
@@ -1379,7 +1321,6 @@ def shortage_poll_run():
             }
             msg = _render_instant_alert(ndc, doc, event)
 
-            # Fanout to watchers (best-effort)
             try:
                 watchers_ref = db.collection("ndc_watchers").document(ndc).collection("watchers")
                 for w in watchers_ref.stream():
@@ -1394,17 +1335,17 @@ def shortage_poll_run():
                         u = usnap.to_dict() or {}
                         u = {**u, "user_id": user_id}
                         _send_message_best_effort(u, msg, ndc=ndc)
-                        alerted += 1
+                        alerted_attempted += 1
                     except Exception:
                         continue
             except Exception as e:
                 log.error("shortage_poll_watchers_failed ndc=%s err=%s", str(ndc), str(e))
 
-    return jsonify({"ok": True, "processed": processed, "changed": changed, "alerted_attempted": alerted}), 200
+    return jsonify({"ok": True, "processed": processed, "changed": changed, "alerted_attempted": alerted_attempted}), 200
 
 @app.route("/weekly_recap_run", methods=["POST"])
+@require_operator_auth
 def weekly_recap_run():
-    """Generate + persist a weekly confidence-reset summary, then notify eligible users."""
     lim = _safe_limits_or_none()
     if lim is None:
         return jsonify({"error": "limits_missing_or_invalid"}), 500
@@ -1416,9 +1357,15 @@ def weekly_recap_run():
     from datetime import datetime as _dt, timedelta as _td
     seven_days_ago = _dt.utcnow() - _td(days=7)
 
-    # Query shortages updated this week
     try:
-        q = db.collection("drug_shortages").where("last_updated", ">=", seven_days_ago).stream()
+        # Bounded read (quick win): read only slightly more than we might render
+        q = (
+            db.collection("drug_shortages")
+            .where("last_updated", ">=", seven_days_ago)
+            .limit(max_items + 100)
+            .stream()
+        )
+
         lines_list: List[str] = []
         for doc in q:
             d = doc.to_dict() or {}
@@ -1429,6 +1376,7 @@ def weekly_recap_run():
                 lines_list.append(f"• {name} ({ndc})")
             else:
                 lines_list.append(f"• {name}")
+
     except Exception as e:
         log.error("weekly_recap_query_failed err=%s", str(e))
         return jsonify({"error": "weekly_recap_query_failed"}), 500
@@ -1442,7 +1390,7 @@ def weekly_recap_run():
     artifact = _write_weekly_summary_artifact(week_key, observed, lines_list, max_items)
     msg = _render_weekly_summary(artifact)
 
-    sent = 0
+    sent_attempted = 0
     skipped = 0
 
     for snap in db.collection("users").stream():
@@ -1450,18 +1398,20 @@ def weekly_recap_run():
         user_id = snap.id
         u = {**u, "user_id": user_id}
         try:
-            log.info(
-                "weekly_recap_target user_id=%s status=%s has_tg=%s",
-                str(u.get("user_id")),
-                str(u.get("status")),
-                str(bool(u.get("telegram_chat_id"))),
-            )
             _send_message_best_effort(u, msg, ndc=None)
             if u.get("status") == "active":
-                sent += 1
+                sent_attempted += 1
         except Exception:
             skipped += 1
 
-    return jsonify({"ok": True, "week_key": week_key, "observed": observed, "limit": max_items, "sent_attempted": sent, "skipped": skipped}), 200
+    return jsonify({
+        "ok": True,
+        "week_key": week_key,
+        "observed": observed,
+        "limit": max_items,
+        "sent_attempted": sent_attempted,
+        "skipped": skipped
+    }), 200
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
